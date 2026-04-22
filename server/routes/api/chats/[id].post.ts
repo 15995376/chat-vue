@@ -1,20 +1,85 @@
 import type { UIMessage } from 'ai'
-import { convertToModelMessages, createUIMessageStream, createUIMessageStreamResponse, generateText, smoothStream, stepCountIs, streamText } from 'ai'
-import { gateway } from '@ai-sdk/gateway'
+import { createUIMessageStream, createUIMessageStreamResponse } from 'ai'
 import { z } from 'zod'
-import type { AnthropicLanguageModelOptions } from '@ai-sdk/anthropic'
-import { anthropic } from '@ai-sdk/anthropic'
-import type { GoogleLanguageModelOptions } from '@ai-sdk/google'
-// import { google } from '@ai-sdk/google'
-import type { OpenAILanguageModelResponsesOptions } from '@ai-sdk/openai'
-import { openai } from '@ai-sdk/openai'
 import { useUserSession } from '../../../utils/session'
 import { useDrizzle, tables, eq, and } from '../../../utils/drizzle'
 import { defineHandler, HTTPError } from 'nitro'
 import { getValidatedRouterParams, readValidatedBody } from 'nitro/h3'
-import { weatherTool } from '../../../utils/tools/weather'
-import { chartTool } from '../../../utils/tools/chart'
 import { MODELS } from '../../../../shared/utils/models'
+
+// FastGPT API 配置
+const FASTGPT_API_URL = process.env.FASTGPT_API_URL || 'https://api.fastgpt.in'
+const FASTGPT_API_KEY = process.env.FASTGPT_API_KEY || ''
+
+// 将 UIMessage 转换为 FastGPT 消息格式
+function convertToFastGPTMessages(messages: UIMessage[]) {
+  return messages.map(msg => {
+    // 提取文本内容
+    let content = ''
+    if (msg.parts) {
+      for (const part of msg.parts) {
+        if (part.type === 'text') {
+          content += part.text
+        }
+      }
+    }
+    return {
+      role: msg.role as 'user' | 'assistant' | 'system',
+      content
+    }
+  })
+}
+
+// 生成标题的函数
+async function generateTitleFromFastGPT(message: UIMessage): Promise<string> {
+  let content = ''
+  if (message.parts) {
+    for (const part of message.parts) {
+      if (part.type === 'text') {
+        content += part.text
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`${FASTGPT_API_URL}/api/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${FASTGPT_API_KEY}`
+      },
+      body: JSON.stringify({
+        stream: false,
+        messages: [
+          {
+            role: 'system',
+            content: `You are a title generator for a chat:
+          - Generate a short title based on the first user's message
+          - The title should be less than 30 characters long
+          - The title should be a summary of the user's message
+          - Do not use quotes (' or ") or colons (:) or any other punctuation
+          - Do not use markdown, just plain text`
+          },
+          {
+            role: 'user',
+            content
+          }
+        ]
+      })
+    })
+
+    if (!response.ok) {
+      console.error('[FastGPT] Title generation failed:', response.statusText)
+      return content.slice(0, 30)
+    }
+
+    const data = await response.json() as { choices?: { message?: { content?: string } }[] }
+    return data.choices?.[0]?.message?.content?.slice(0, 30) || content.slice(0, 30)
+  } catch (error) {
+    console.error('[FastGPT] Title generation error:', error)
+    return content.slice(0, 30)
+  }
+}
 
 export default defineHandler(async (event) => {
   const session = await useUserSession(event)
@@ -23,7 +88,7 @@ export default defineHandler(async (event) => {
     id: z.string()
   }).parse)
 
-  const { model, messages } = await readValidatedBody(event, z.object({
+  const { messages } = await readValidatedBody(event, z.object({
     model: z.string().refine(value => MODELS.some(m => m.value === value), {
       message: 'Invalid model'
     }),
@@ -43,17 +108,7 @@ export default defineHandler(async (event) => {
   }
 
   if (!chat.title) {
-    const { text: title } = await generateText({
-      model: gateway('openai/gpt-4.1-nano'),
-      system: `You are a title generator for a chat:
-          - Generate a short title based on the first user's message
-          - The title should be less than 30 characters long
-          - The title should be a summary of the user's message
-          - Do not use quotes (' or ") or colons (:) or any other punctuation
-          - Do not use markdown, just plain text`,
-      prompt: JSON.stringify(messages[0])
-    })
-
+    const title = await generateTitleFromFastGPT(messages[0])
     await db.update(tables.chats).set({ title }).where(eq(tables.chats.id, id as string))
   }
 
@@ -72,61 +127,26 @@ export default defineHandler(async (event) => {
 
   const stream = createUIMessageStream({
     execute: async ({ writer }) => {
-      const result = streamText({
-        abortSignal: abortController.signal,
-        model: gateway(model),
-        system: `You are a knowledgeable and helpful AI assistant. ${session.data.user?.username ? `The user's name is ${session.data.user.username}.` : ''} Your goal is to provide clear, accurate, and well-structured responses.
+      // 调用 FastGPT API
+      const fastgptMessages = convertToFastGPTMessages(messages)
 
-**FORMATTING RULES (CRITICAL):**
-- ABSOLUTELY NO MARKDOWN HEADINGS: Never use #, ##, ###, ####, #####, or ######
-- NO underline-style headings with === or ---
-- Use **bold text** for emphasis and section labels instead
-- Examples:
-  * Instead of "## Usage", write "**Usage:**" or just "Here's how to use it:"
-  * Instead of "# Complete Guide", write "**Complete Guide**" or start directly with content
-- Start all responses with content, never with a heading
-
-**WEB SEARCH:**
-- You have access to a web search tool to find current, up-to-date information
-- Only use it when the user explicitly asks about recent events, real-time data, or current facts
-- Do NOT search proactively — rely on your knowledge first
-- Cite your sources when providing information from web search results
-
-**RESPONSE QUALITY:**
-- Be concise yet comprehensive
-- Use examples when helpful
-- Break down complex topics into digestible parts
-- Maintain a friendly, professional tone`,
-        messages: await convertToModelMessages(messages),
-        tools: {
-          chart: chartTool,
-          weather: weatherTool,
-          ...(model.startsWith('anthropic/') && { web_search: anthropic.tools.webSearch_20250305() }),
-          ...(model.startsWith('openai/') && { web_search: openai.tools.webSearch() })
-          // TODO: enable once AI SDK supports combining provider-defined tools with custom tools
-          // ...(model.startsWith('google/') && { google_search: google.tools.googleSearch({}) })
+      const response = await fetch(`${FASTGPT_API_URL}/api/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${FASTGPT_API_KEY}`
         },
-        providerOptions: {
-          anthropic: {
-            thinking: {
-              type: 'enabled',
-              budgetTokens: 2048
-            }
-          } satisfies AnthropicLanguageModelOptions,
-          google: {
-            thinkingConfig: {
-              includeThoughts: true,
-              thinkingLevel: 'low'
-            }
-          } satisfies GoogleLanguageModelOptions,
-          openai: {
-            reasoningEffort: 'low',
-            reasoningSummary: 'detailed'
-          } satisfies OpenAILanguageModelResponsesOptions
-        },
-        stopWhen: stepCountIs(5),
-        experimental_transform: smoothStream()
+        body: JSON.stringify({
+          stream: true,
+          messages: fastgptMessages
+        }),
+        signal: abortController.signal
       })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`FastGPT API error: ${response.status} ${errorText}`)
+      }
 
       if (!chat.title) {
         writer.write({
@@ -136,10 +156,64 @@ export default defineHandler(async (event) => {
         })
       }
 
-      writer.merge(result.toUIMessageStream({
-        sendSources: true,
-        sendReasoning: true
-      }))
+      // 处理 SSE 流
+      const reader = response.body?.getReader()
+      if (!reader) {
+        throw new Error('No response body')
+      }
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      // 生成消息 ID
+      const messageId = crypto.randomUUID()
+
+      // 开始新消息
+      writer.write({
+        type: 'start',
+        id: messageId,
+        role: 'assistant'
+      })
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed || !trimmed.startsWith('data:')) continue
+
+          const data = trimmed.slice(5).trim()
+          if (data === '[DONE]') continue
+
+          try {
+            const parsed = JSON.parse(data) as {
+              choices?: {
+                delta?: { content?: string }
+              }[]
+            }
+            const content = parsed.choices?.[0]?.delta?.content
+            if (content) {
+              writer.write({
+                type: 'text',
+                text: content
+              })
+            }
+          } catch {
+            // 忽略解析错误
+          }
+        }
+      }
+
+      // 结束消息
+      writer.write({
+        type: 'finish',
+        finishReason: 'stop'
+      })
     },
     onFinish: async ({ messages }) => {
       await db.insert(tables.messages).values(messages.map(message => ({
